@@ -2,3 +2,4 @@
 test.py
 steam_stats.db
 service_account.json
+__pycache__/
