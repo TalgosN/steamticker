@@ -70,10 +70,6 @@ def init_and_sync_db(sheet_data):
                         (url, steam_id, club, status)
                     )
 
-# Запуск первого этапа
-accounts_data = get_accounts_from_sheets(sh)
-init_and_sync_db(accounts_data)
-
 
 def fetch_games_and_snapshot(api_key):
     with sqlite3.connect('steam_stats.db') as conn:
@@ -109,36 +105,64 @@ def fetch_games_and_snapshot(api_key):
             time.sleep(1.5)
 
 def export_clubs_to_sheets(sh):
-    wks_games = sh.worksheet_by_title('Игры')
-    # Берем первый столбец, пропуская заголовок
-    target_games = wks_games.get_col(1, include_tailing_empty=False)[1:]
+    try:
+        wks_games = sh.worksheet_by_title('Игры')
+        target_games = wks_games.get_col(1, include_tailing_empty=False)[1:]
+    except pygsheets.WorksheetNotFound:
+        print("Лист 'Игры' не найден, выгрузка отменена.")
+        return
+
+    if not target_games:
+        print("Список игр пуст, выгружать нечего.")
+        return
+
     with sqlite3.connect('steam_stats.db') as conn:
-        # Динамически генерируем знаки вопроса для безопасной подстановки в SQL
         placeholders = ','.join('?' * len(target_games))
         
-        query = f'''
+        # Запрос 1: Только актуальное состояние (последний замер по каждой игре)
+        query_current = f'''
             WITH LatestSnapshots AS (
-                SELECT steam_id, app_id, playtime_minutes,
+                SELECT steam_id, app_id, playtime_minutes, recorded_at,
                        ROW_NUMBER() OVER(PARTITION BY steam_id, app_id ORDER BY recorded_at DESC) as rn
                 FROM snapshots
             )
-            SELECT a.club_name, a.vanity_url, g.name AS game_name, s.playtime_minutes
+            SELECT a.club_name, a.vanity_url AS nickname, g.name AS game_name, s.playtime_minutes, s.recorded_at
             FROM LatestSnapshots s
             JOIN accounts a ON s.steam_id = a.steam_id
             JOIN games g ON s.app_id = g.app_id
             WHERE s.rn = 1 AND g.name IN ({placeholders})
         '''
-        # Передаем target_games как параметры для правильной работы SQL
-        df = pd.read_sql_query(query, conn, params=target_games)
+        df_current = pd.read_sql_query(query_current, conn, params=target_games)
 
-    for club_name, club_df in df.groupby('club_name'):
-        try:
-            wks = sh.worksheet_by_title(club_name)
-        except pygsheets.WorksheetNotFound:
-            wks = sh.add_worksheet(club_name)
-        
-        wks.clear()
-        wks.set_dataframe(club_df, start='A1', copy_head=True)
+        # Запрос 2: Вся история отсечек для таймлайнов
+        query_history = f'''
+            SELECT s.recorded_at, a.club_name, a.vanity_url AS nickname, g.name AS game_name, s.playtime_minutes
+            FROM snapshots s
+            JOIN accounts a ON s.steam_id = a.steam_id
+            JOIN games g ON s.app_id = g.app_id
+            WHERE g.name IN ({placeholders})
+            ORDER BY s.recorded_at DESC
+        '''
+        # Передаем target_games еще раз для второго запроса
+        df_history = pd.read_sql_query(query_history, conn, params=target_games)
+
+    # Заливаем актуальный срез
+    try:
+        wks_current = sh.worksheet_by_title('Current_State')
+    except pygsheets.WorksheetNotFound:
+        wks_current = sh.add_worksheet('Current_State')
+    
+    wks_current.clear()
+    wks_current.set_dataframe(df_current, start='A1', copy_head=True, fit=True)
+
+    # Заливаем исторический лог
+    try:
+        wks_history = sh.worksheet_by_title('Historical_Log')
+    except pygsheets.WorksheetNotFound:
+        wks_history = sh.add_worksheet('Historical_Log')
+    
+    wks_history.clear()
+    wks_history.set_dataframe(df_history, start='A1', copy_head=True, fit=True)
 
 
 def main_pipeline():
@@ -149,13 +173,10 @@ def main_pipeline():
     export_clubs_to_sheets(sh)
     print("Синхронизация завершена. Ожидание.")
 
-# Запускаем один раз сразу при включении
-main_pipeline()
+if __name__ == '__main__':
+    main_pipeline()
+    schedule.every(24).hours.do(main_pipeline)
 
-# Настраиваем фоновое расписание (например, каждые 4 часа)
-schedule.every(4).hours.do(main_pipeline)
-
-# Бесконечный цикл, который просто проверяет, не настало ли время
-while True:
-    schedule.run_pending()
-    time.sleep(60)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
