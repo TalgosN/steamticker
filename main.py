@@ -106,7 +106,7 @@ def fetch_games_and_snapshot(api_key):
             time.sleep(1.5)
 
 def get_game_description(app_id):
-    url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&l=russian"
+    url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&l=english"
     try:
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
@@ -122,33 +122,33 @@ def get_game_description(app_id):
 def enrich_games_with_descriptions(sh):
     try:
         wks_games = sh.worksheet_by_title('Игры')
-        target_games = wks_games.get_col(1, include_tailing_empty=False)[1:]
+        # Получаем все данные из таблицы (Название в A, Кол-во в B)
+        raw_data = wks_games.get_all_values(include_tailing_empty=False)[1:]
     except pygsheets.WorksheetNotFound:
         return
 
-    if not target_games:
+    if not raw_data:
         return
 
     with sqlite3.connect('steam_stats.db') as conn:
         cursor = conn.cursor()
         
-        cursor.execute('''
-            UPDATE games 
-            SET player_count = (
-                SELECT COUNT(DISTINCT steam_id) 
-                FROM snapshots 
-                WHERE snapshots.app_id = games.app_id
-            )
-        ''')
+        # Шаг 1: Синхронизируем количество игроков из таблицы в SQL
+        for row in raw_data:
+            name = row[0]
+            count = row[1] if len(row) > 1 else 0
+            cursor.execute("UPDATE games SET player_count = ? WHERE name = ?", (count, name))
         conn.commit()
 
-        placeholders = ','.join('?' * len(target_games))
-        query_fetch = f"SELECT app_id, name FROM games WHERE name IN ({placeholders}) AND (description IS NULL OR description = '')"
-        cursor.execute(query_fetch, target_games)
+        # Шаг 2: Проверяем, для каких игр из списка еще нет описания в базе
+        target_names = [r[0] for r in raw_data]
+        placeholders = ','.join('?' * len(target_names))
+        
+        cursor.execute(f"SELECT app_id, name FROM games WHERE name IN ({placeholders}) AND (description IS NULL OR description = '')", target_names)
         to_fetch = cursor.fetchall()
         
         if to_fetch:
-            print(f"Загрузка описаний для {len(to_fetch)} игр...")
+            print(f"Загрузка английских описаний для {len(to_fetch)} игр...")
             for app_id, name in to_fetch:
                 desc = get_game_description(app_id)
                 if desc:
@@ -156,12 +156,17 @@ def enrich_games_with_descriptions(sh):
                     conn.commit()
                 time.sleep(1.5)
 
-        query_df = f"SELECT name AS 'Название', description AS 'Описание', player_count AS 'Кол-во аккаунтов' FROM games WHERE name IN ({placeholders})"
-        df_info = pd.read_sql_query(query_df, conn, params=target_games)
-        df_info = df_info.sort_values('Название')
+        # Шаг 3: Собираем финальный датафрейм (Название, Кол-во, Описание) для возврата в таблицу
+        query_df = f"SELECT name, player_count, description FROM games WHERE name IN ({placeholders})"
+        df_info = pd.read_sql_query(query_df, conn, params=target_names)
+        
+        # Сортируем по порядку из таблицы, чтобы не перемешивать строки
+        df_info['name'] = pd.Categorical(df_info['name'], categories=target_names, ordered=True)
+        df_info = df_info.sort_values('name')
 
+    # Выгружаем обратно: A - Название, B - Кол-во, C - Описание
     wks_games.set_dataframe(df_info, start='A1', copy_head=True, fit=True)
-
+    
 def export_clubs_to_sheets(sh):
     try:
         wks_games = sh.worksheet_by_title('Игры')
