@@ -10,10 +10,11 @@ import schedule
 load_dotenv()
 API_KEY = os.getenv('STEAM_API_KEY')
 TABLE_NAME = os.getenv('TABLE_NAME')
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN')
+TG_CHAT_ID = os.getenv('TG_CHAT_ID')
 
 gc = pygsheets.authorize(service_file='service_account.json')
 sh = gc.open(TABLE_NAME)
-wks_config = sh.worksheet_by_title('Config')
 
 def get_accounts_from_sheets(sh):
     wks_config = sh.worksheet_by_title('Config')
@@ -36,7 +37,9 @@ def init_and_sync_db(sheet_data):
             );
             CREATE TABLE IF NOT EXISTS games (
                 app_id INTEGER PRIMARY KEY,
-                name TEXT
+                name TEXT,
+                description TEXT,
+                player_count INTEGER
             );
         ''')
         cursor = conn.cursor()
@@ -70,7 +73,6 @@ def init_and_sync_db(sheet_data):
                         (url, steam_id, club, status)
                     )
 
-
 def fetch_games_and_snapshot(api_key):
     with sqlite3.connect('steam_stats.db') as conn:
         cursor = conn.cursor()
@@ -101,25 +103,78 @@ def fetch_games_and_snapshot(api_key):
                         (game.get('appid'), game.get('name'))
                     )
             
-            # Архитектурная необходимость: пауза 1.5 сек между аккаунтами для обхода rate limit
             time.sleep(1.5)
+
+def get_game_description(app_id):
+    url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&l=russian"
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            if data and str(app_id) in data and data[str(app_id)].get('success'):
+                desc = data[str(app_id)]['data'].get('short_description', '')
+                clean_desc = desc.replace('&quot;', '"').replace('<br>', '\n')
+                return clean_desc
+    except Exception as e:
+        print(f"Ошибка получения описания для {app_id}: {e}")
+    return None
+
+def enrich_games_with_descriptions(sh):
+    try:
+        wks_games = sh.worksheet_by_title('Игры')
+        target_games = wks_games.get_col(1, include_tailing_empty=False)[1:]
+    except pygsheets.WorksheetNotFound:
+        return
+
+    if not target_games:
+        return
+
+    with sqlite3.connect('steam_stats.db') as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE games 
+            SET player_count = (
+                SELECT COUNT(DISTINCT steam_id) 
+                FROM snapshots 
+                WHERE snapshots.app_id = games.app_id
+            )
+        ''')
+        conn.commit()
+
+        placeholders = ','.join('?' * len(target_games))
+        query_fetch = f"SELECT app_id, name FROM games WHERE name IN ({placeholders}) AND (description IS NULL OR description = '')"
+        cursor.execute(query_fetch, target_games)
+        to_fetch = cursor.fetchall()
+        
+        if to_fetch:
+            print(f"Загрузка описаний для {len(to_fetch)} игр...")
+            for app_id, name in to_fetch:
+                desc = get_game_description(app_id)
+                if desc:
+                    cursor.execute("UPDATE games SET description = ? WHERE app_id = ?", (desc, app_id))
+                    conn.commit()
+                time.sleep(1.5)
+
+        query_df = f"SELECT name AS 'Название', description AS 'Описание', player_count AS 'Кол-во аккаунтов' FROM games WHERE name IN ({placeholders})"
+        df_info = pd.read_sql_query(query_df, conn, params=target_games)
+        df_info = df_info.sort_values('Название')
+
+    wks_games.set_dataframe(df_info, start='A1', copy_head=True, fit=True)
 
 def export_clubs_to_sheets(sh):
     try:
         wks_games = sh.worksheet_by_title('Игры')
         target_games = wks_games.get_col(1, include_tailing_empty=False)[1:]
     except pygsheets.WorksheetNotFound:
-        print("Лист 'Игры' не найден, выгрузка отменена.")
         return
 
     if not target_games:
-        print("Список игр пуст, выгружать нечего.")
         return
 
     with sqlite3.connect('steam_stats.db') as conn:
         placeholders = ','.join('?' * len(target_games))
         
-        # Запрос 1: Только актуальное состояние (последний замер по каждой игре)
         query_current = f'''
             WITH LatestSnapshots AS (
                 SELECT steam_id, app_id, playtime_minutes, recorded_at,
@@ -134,7 +189,6 @@ def export_clubs_to_sheets(sh):
         '''
         df_current = pd.read_sql_query(query_current, conn, params=target_games)
 
-        # Запрос 2: Вся история отсечек для таймлайнов
         query_history = f'''
             SELECT s.recorded_at, a.club_name, a.vanity_url AS nickname, g.name AS game_name, s.playtime_minutes
             FROM snapshots s
@@ -143,39 +197,67 @@ def export_clubs_to_sheets(sh):
             WHERE g.name IN ({placeholders})
             ORDER BY s.recorded_at DESC
         '''
-        # Передаем target_games еще раз для второго запроса
         df_history = pd.read_sql_query(query_history, conn, params=target_games)
 
-    # Заливаем актуальный срез
     try:
         wks_current = sh.worksheet_by_title('Current_State')
     except pygsheets.WorksheetNotFound:
         wks_current = sh.add_worksheet('Current_State')
-    
     wks_current.clear()
     wks_current.set_dataframe(df_current, start='A1', copy_head=True, fit=True)
 
-    # Заливаем исторический лог
     try:
         wks_history = sh.worksheet_by_title('Historical_Log')
     except pygsheets.WorksheetNotFound:
         wks_history = sh.add_worksheet('Historical_Log')
-    
     wks_history.clear()
     wks_history.set_dataframe(df_history, start='A1', copy_head=True, fit=True)
 
+def process_promo_post(sh):
+    try:
+        wks = sh.worksheet_by_title('Промо-план')
+        records = wks.get_all_records()
+    except pygsheets.WorksheetNotFound:
+        print("Лист 'Промо-план' не найден.")
+        return
+
+    for i, row in enumerate(records):
+        if row.get('Статус') == 'Ожидает':
+            game_name = row.get('Игра')
+            
+            text = (f"🎮 Игра недели: {game_name}!\n\n"
+                    f"Всем обязательно поиграть и рекомендовать клиентам. "
+                    f"На этой неделе на нее действует скидка 100 рублей.")
+            
+            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+            res = requests.post(url, json={'chat_id': TG_CHAT_ID, 'text': text})
+            
+            if res.status_code == 200:
+                wks.update_value(f'B{i + 2}', 'Опубликовано')
+                print(f"Анонс по {game_name} успешно отправлен в чат.")
+            else:
+                print(f"Ошибка отправки в ТГ: {res.text}")
+            
+            break
 
 def main_pipeline():
     print("Старт цикла обновления...")
     accounts_data = get_accounts_from_sheets(sh)
     init_and_sync_db(accounts_data)
     fetch_games_and_snapshot(API_KEY)
+    
+    enrich_games_with_descriptions(sh)
     export_clubs_to_sheets(sh)
+    
     print("Синхронизация завершена. Ожидание.")
 
 if __name__ == '__main__':
+    # Разовый запуск при старте
     main_pipeline()
-    schedule.every(24).hours.do(main_pipeline)
+
+    # Основное расписание
+    schedule.every(4).hours.do(main_pipeline)
+    schedule.every().monday.at("10:00").do(process_promo_post, sh)
 
     while True:
         schedule.run_pending()
