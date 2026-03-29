@@ -257,7 +257,7 @@ if __name__ == '__main__':
 
     # Основное расписание
     schedule.every(4).hours.do(main_pipeline)
-    schedule.every().monday.at("10:00").do(process_promo_post, sh)
+    schedule.every().day.at("10:00").do(process_promo_post, sh)
 
     while True:
         schedule.run_pending()
