@@ -122,11 +122,10 @@ def get_game_description(app_id):
 def enrich_games_with_descriptions(sh):
     try:
         wks_games = sh.worksheet_by_title('Игры')
+        # Читаем Название(A), Кол-во(B) и Описание(C)
         raw_data = wks_games.get_all_values(include_tailing_empty=False)[1:]
-        
-        # Отсекаем пустые строки, чтобы не ловить IndexError
+        # Убираем пустые строки
         raw_data = [row for row in raw_data if row and str(row[0]).strip()]
-        
     except pygsheets.WorksheetNotFound:
         return
 
@@ -136,14 +135,21 @@ def enrich_games_with_descriptions(sh):
     with sqlite3.connect('steam_stats.db') as conn:
         cursor = conn.cursor()
         
-        # Шаг 1: Синхронизируем количество игроков из таблицы в SQL
+        # 1. Синхронизируем ручные правки из таблицы в базу
         for row in raw_data:
             name = row[0]
             count = row[1] if len(row) > 1 else 0
+            # Забираем описание из колонки C, если оно там есть
+            manual_desc = row[2] if len(row) > 2 else ""
+            
             cursor.execute("UPDATE games SET player_count = ? WHERE name = ?", (count, name))
+            
+            # Если в ячейке что-то написано, обновляем базу этим текстом
+            if manual_desc.strip():
+                cursor.execute("UPDATE games SET description = ? WHERE name = ?", (manual_desc, name))
         conn.commit()
 
-        # Шаг 2: Проверяем, для каких игр из списка еще нет описания в базе
+        # 2. Докачиваем из Steam только то, чего нет ни в базе, ни в таблице
         target_names = [r[0] for r in raw_data]
         placeholders = ','.join('?' * len(target_names))
         
@@ -159,17 +165,15 @@ def enrich_games_with_descriptions(sh):
                     conn.commit()
                 time.sleep(1.5)
 
-        # Шаг 3: Собираем финальный датафрейм (Название, Кол-во, Описание) для возврата в таблицу
+        # 3. Выгружаем актуальный микс (ручное + авто) обратно в таблицу
         query_df = f"SELECT name, player_count, description FROM games WHERE name IN ({placeholders})"
         df_info = pd.read_sql_query(query_df, conn, params=target_names)
         
-        # Сортируем по порядку из таблицы, чтобы не перемешивать строки
         df_info['name'] = pd.Categorical(df_info['name'], categories=target_names, ordered=True)
         df_info = df_info.sort_values('name')
 
-    # Выгружаем обратно: A - Название, B - Кол-во, C - Описание
     wks_games.set_dataframe(df_info, start='A1', copy_head=True, fit=True)
-    
+
 def export_clubs_to_sheets(sh):
     try:
         wks_games = sh.worksheet_by_title('Игры')
@@ -233,7 +237,40 @@ def process_promo_post(sh):
         if row.get('Статус') == 'Ожидает':
             game_name = row.get('Игра')
             
-            text = (f"🎮 Игра недели: {game_name}!\n\n"
+            # Идем в базу за описанием и количеством игроков
+            description = "Описание отсутствует."
+            players_text = "Неизвестно"
+            
+            try:
+                with sqlite3.connect('steam_stats.db') as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT player_count, description FROM games WHERE name = ?", (game_name,))
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        p_count, desc = result
+                        
+                        if desc:
+                            description = desc
+                            
+                        # Форматируем количество игроков
+                        try:
+                            p_count_int = int(p_count)
+                            if p_count_int > 1:
+                                players_text = f"1 - {p_count_int}"
+                            else:
+                                players_text = f"{p_count_int}"
+                        except (ValueError, TypeError):
+                            # Если в базе уже лежит строка формата "1-4" из ручного ввода
+                            players_text = str(p_count) if p_count else "1"
+                            
+            except Exception as e:
+                print(f"Ошибка при обращении к БД: {e}")
+            
+            # Собираем финальный текст поста
+            text = (f"🎮 Игра недели: {game_name}!\n"
+                    f"👥 Количество игроков: {players_text}\n\n"
+                    f"📖 Описание:\n{description}\n\n"
                     f"Всем обязательно поиграть и рекомендовать клиентам. "
                     f"На этой неделе на нее действует скидка 100 рублей.")
             
@@ -241,6 +278,7 @@ def process_promo_post(sh):
             res = requests.post(url, json={'chat_id': TG_CHAT_ID, 'text': text})
             
             if res.status_code == 200:
+                # pygsheets считает строки с 1, плюс заголовок, поэтому i + 2
                 wks.update_value(f'B{i + 2}', 'Опубликовано')
                 print(f"Анонс по {game_name} успешно отправлен в чат.")
             else:
