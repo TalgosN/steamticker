@@ -122,8 +122,11 @@ def get_game_description(app_id):
 def enrich_games_with_descriptions(sh):
     try:
         wks_games = sh.worksheet_by_title('Игры')
-        # Получаем все данные из таблицы (Название в A, Кол-во в B)
         raw_data = wks_games.get_all_values(include_tailing_empty=False)[1:]
+        
+        # Отсекаем пустые строки, чтобы не ловить IndexError
+        raw_data = [row for row in raw_data if row and str(row[0]).strip()]
+        
     except pygsheets.WorksheetNotFound:
         return
 
