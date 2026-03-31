@@ -6,12 +6,20 @@ from dotenv import load_dotenv
 import time
 import pandas as pd
 import schedule
+import telebot
+import threading
+import ai_generator
+
+
 
 load_dotenv()
 API_KEY = os.getenv('STEAM_API_KEY')
 TABLE_NAME = os.getenv('TABLE_NAME')
 TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN')
-TG_CHAT_ID = os.getenv('TG_CHAT_ID')
+ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
+TG_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
+
+bot = telebot.TeleBot(TG_BOT_TOKEN)
 
 gc = pygsheets.authorize(service_file='service_account.json')
 sh = gc.open(TABLE_NAME)
@@ -230,61 +238,89 @@ def process_promo_post(sh):
         wks = sh.worksheet_by_title('Промо-план')
         records = wks.get_all_records()
     except pygsheets.WorksheetNotFound:
-        print("Лист 'Промо-план' не найден.")
         return
 
     for i, row in enumerate(records):
         if row.get('Статус') == 'Ожидает':
             game_name = row.get('Игра')
+            row_idx = i + 2
             
-            # Идем в базу за описанием и количеством игроков
             description = "Описание отсутствует."
             players_text = "Неизвестно"
             
-            try:
-                with sqlite3.connect('steam_stats.db') as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT player_count, description FROM games WHERE name = ?", (game_name,))
-                    result = cursor.fetchone()
-                    
-                    if result:
-                        p_count, desc = result
-                        
-                        if desc:
-                            description = desc
-                            
-                        # Форматируем количество игроков
-                        try:
-                            p_count_int = int(p_count)
-                            if p_count_int > 1:
-                                players_text = f"1 - {p_count_int}"
-                            else:
-                                players_text = f"{p_count_int}"
-                        except (ValueError, TypeError):
-                            # Если в базе уже лежит строка формата "1-4" из ручного ввода
-                            players_text = str(p_count) if p_count else "1"
-                            
-            except Exception as e:
-                print(f"Ошибка при обращении к БД: {e}")
+            with sqlite3.connect('steam_stats.db') as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT player_count, description FROM games WHERE name = ?", (game_name,))
+                res = cursor.fetchone()
+                if res:
+                    p_count, desc = res
+                    if desc: description = desc
+                    try:
+                        players_text = f"1 - {int(p_count)}" if int(p_count) > 1 else str(p_count)
+                    except:
+                        players_text = str(p_count) if p_count else "1"
+
+            # Генерируем текст через наш новый файл
+            draft_text = ai_generator.generate_promo(game_name, players_text, description)
             
-            # Собираем финальный текст поста
-            text = (f"🎮 Игра недели: {game_name}!\n"
-                    f"👥 Количество игроков: {players_text}\n\n"
-                    f"📖 Описание:\n{description}\n\n"
-                    f"Всем обязательно поиграть и рекомендовать клиентам. "
-                    f"На этой неделе на нее действует скидка 100 рублей.")
+            # Собираем инлайн-кнопки
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.add(
+                telebot.types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"promo_pub_{row_idx}"),
+                telebot.types.InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"promo_regen_{row_idx}")
+            )
             
-            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-            res = requests.post(url, json={'chat_id': TG_CHAT_ID, 'text': text})
-            
-            if res.status_code == 200:
-                # pygsheets считает строки с 1, плюс заголовок, поэтому i + 2
-                wks.update_value(f'B{i + 2}', 'Опубликовано')
-                print(f"Анонс по {game_name} успешно отправлен в чат.")
-            else:
-                print(f"Ошибка отправки в ТГ: {res.text}")
-            
+            # Отправляем черновик админу
+            bot.send_message(ADMIN_CHAT_ID, draft_text, reply_markup=markup)
             break
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('promo_'))
+def handle_promo_buttons(call):
+    action, row_str = call.data.split('_')[1:]
+    row_idx = int(row_str)
+    
+    try:
+        wks = sh.worksheet_by_title('Промо-план')
+        game_name = wks.get_value(f'A{row_idx}')
+    except Exception:
+        bot.answer_callback_query(call.id, "Ошибка доступа к таблице")
+        return
+
+    if action == 'regen':
+        bot.edit_message_text("Генерирую новый вариант...", call.message.chat.id, call.message.message_id)
+        
+        # Снова лезем в базу за описанием, чтобы не хранить его в памяти бота
+        description = ""
+        players_text = "1"
+        with sqlite3.connect('steam_stats.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT player_count, description FROM games WHERE name = ?", (game_name,))
+            res = cursor.fetchone()
+            if res:
+                p_count, desc = res
+                if desc: description = desc
+                try:
+                    players_text = f"1 - {int(p_count)}" if int(p_count) > 1 else str(p_count)
+                except:
+                    players_text = str(p_count) if p_count else "1"
+                    
+        new_text = ai_generator.generate_promo(game_name, players_text, description)
+        
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(
+            telebot.types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"promo_pub_{row_idx}"),
+            telebot.types.InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"promo_regen_{row_idx}")
+        )
+        bot.edit_message_text(new_text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+        
+    elif action == 'pub':
+        # Убираем кнопки из сообщения админа
+        bot.edit_message_text(f"{call.message.text}\n\n✅ Опубликовано.", call.message.chat.id, call.message.message_id)
+        # Отправляем в общий чат сотрудников
+        bot.send_message(TG_CHAT_ID, call.message.text)
+        # Обновляем таблицу
+        wks.update_value(f'B{row_idx}', 'Опубликовано')
+        wks.update_value(f'C{row_idx}', call.message.text)
 
 def main_pipeline():
     print("Старт цикла обновления...")
@@ -298,12 +334,13 @@ def main_pipeline():
     print("Синхронизация завершена. Ожидание.")
 
 if __name__ == '__main__':
-    # Разовый запуск при старте
     main_pipeline()
 
-    # Основное расписание
+    # Запускаем слушателя кнопок в фоне
+    threading.Thread(target=bot.infinity_polling, daemon=True).start()
+
     schedule.every(4).hours.do(main_pipeline)
-    schedule.every().day.at("11:30:00", 'Europe/Moscow').do(process_promo_post, sh)
+    schedule.every(5).minutes.do(process_promo_post, sh)
 
     while True:
         schedule.run_pending()
