@@ -341,7 +341,7 @@ if __name__ == '__main__':
     main_pipeline()
 
     schedule.every(4).hours.do(main_pipeline)
-    schedule.every(5).minutes.do(process_promo_post, sh)
+    schedule.every().monday.at("10:00", tz="Europe/Moscow").do(process_promo_post, sh)
     
     print("Расписание запущено. Ждем 5 минут до проверки промо-плана...")
 
