@@ -20,16 +20,20 @@ def generate_promo(game_name, players_text, description):
         f"Всем обязательно поиграть и рекомендовать клиентам. На этой неделе на нее действует скидка 100 рублей."
     )
     
-    res = requests.post(
-        url="https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        data=json.dumps({
-            "model": "qwen/qwen3.6-plus-preview:free",
-            "messages": [
-                {"role": "system", "content": "Ты опытный геймер и администратор клуба. Пишешь кратко, по делу и без типографского пафоса."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.7  # Добавим немного креативности для человечности
-        })
-    )
-    return res.json()['choices'][0]['message']['content']
+    try:
+        res = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            data=json.dumps({
+                "model": "qwen/qwen3.6-plus-preview:free",
+                "messages": [
+                    {"role": "system", "content": "Ты опытный геймер и администратор клуба. Пишешь кратко, по делу и без типографского пафоса."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.7
+            })
+        )
+        return res.json()['choices'][0]['message']['content']
+    except Exception as e:
+        print(f"Ошибка генерации текста: {e}")
+        return "Ошибка API. Нажми 'Перегенерировать'."

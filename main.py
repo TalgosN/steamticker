@@ -334,14 +334,17 @@ def main_pipeline():
     print("Синхронизация завершена. Ожидание.")
 
 if __name__ == '__main__':
-    main_pipeline()
-
-    # Запускаем слушателя кнопок в фоне
+    # Сначала поднимаем бота, чтобы он сразу был готов слушать кнопки
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
+
+    print("Первичный сбор данных...")
+    main_pipeline()
 
     schedule.every(4).hours.do(main_pipeline)
     schedule.every(5).minutes.do(process_promo_post, sh)
+    
+    print("Расписание запущено. Ждем 5 минут до проверки промо-плана...")
 
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        time.sleep(1) # Ставим 1 секунду вместо 60 для точности расписания
